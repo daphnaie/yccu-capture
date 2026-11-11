@@ -21,8 +21,8 @@ class BleService : Service() {
     companion object {
         private const val CH_ID = "yccu"
         private const val CH_NAME = "YCCU Capture"
-        private val CCCD = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
         
+        private val CCCD = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
         private val SERVICE_UUID = UUID.fromString("6e400001-b5a3-f393-e0a9-e50e24dcca9e")
         private val CHAR_WRITE_UUID = UUID.fromString("6e400002-b5a3-f393-e0a9-e50e24dcca9e")
         private val CHAR_NOTIFY_UUID = UUID.fromString("6e400003-b5a3-f393-e0a9-e50e24dcca9e")
@@ -113,8 +113,15 @@ class BleService : Service() {
         override fun onServicesDiscovered(g: BluetoothGatt, status: Int) {
             NotificationLogger.info("Services discovered, status=$status")
             
-            val wc = g.getService(SERVICE_UUID)?.getCharacteristic(CHAR_WRITE_UUID)
-            val nc = g.getService(SERVICE_UUID)?.getCharacteristic(CHAR_NOTIFY_UUID)
+            // Find ONLY the Yamaha service
+            val yamahaService = g.getService(SERVICE_UUID)
+            if (yamahaService == null) {
+                NotificationLogger.info("ERROR: Yamaha service not found")
+                return
+            }
+
+            val wc = yamahaService.getCharacteristic(CHAR_WRITE_UUID)
+            val nc = yamahaService.getCharacteristic(CHAR_NOTIFY_UUID)
 
             if (wc == null || nc == null) {
                 NotificationLogger.info("ERROR: Yamaha chars not found")
@@ -124,22 +131,26 @@ class BleService : Service() {
             writeChar = wc
             notifyChar = nc
 
-            // Poke EVERY writable characteristic with 01 00 (wakes up handle 0x0010)
-            for (svc in g.services) {
-                for (ch in svc.characteristics) {
-                    if (ch.properties and BluetoothGattCharacteristic.PROPERTY_WRITE != 0 ||
-                        ch.properties and BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE != 0) {
-                        
-                        if (ch.uuid != CHAR_WRITE_UUID) {
-                            ch.value = byteArrayOf(0x01, 0x00)
-                            g.writeCharacteristic(ch)
-                            NotificationLogger.info("Poked ${ch.uuid} with 01 00")
-                        }
+            // 1. Send the 01 00 wake-up (Time Sync / Session Init)
+            var wakeUpSent = false
+            for (ch in yamahaService.characteristics) {
+                if (ch.properties and BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE != 0 ||
+                    ch.properties and BluetoothGattCharacteristic.PROPERTY_WRITE != 0) {
+                    
+                    if (ch.uuid != CHAR_WRITE_UUID) {
+                        ch.value = byteArrayOf(0x01, 0x00)
+                        g.writeCharacteristic(ch)
+                        NotificationLogger.info("Sent 01 00 wake-up to ${ch.uuid}")
+                        wakeUpSent = true
                     }
                 }
             }
+            
+            if (!wakeUpSent) {
+                 NotificationLogger.info("Warning: No wake-up characteristic found!")
+            }
 
-            // Step 1: Subscribe
+            // 2. Subscribe to Notifications
             g.setCharacteristicNotification(nc, true)
             val cccd = nc.getDescriptor(CCCD)
             if (cccd != null) {
@@ -147,13 +158,16 @@ class BleService : Service() {
                 g.writeDescriptor(cccd)
                 NotificationLogger.info("Subscribing to notifications...")
             }
+            
+            // 3. Handshake fallback timer (in case onDescriptorWrite doesn't fire)
+            handler.postDelayed({ sendHandshake(g) }, 1500)
         }
 
         override fun onDescriptorWrite(g: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int) {
             NotificationLogger.info("Subscribed: ${status == BluetoothGatt.GATT_SUCCESS}")
             if (status == BluetoothGatt.GATT_SUCCESS) {
-                // Wait 2 seconds before handshake to let the bike send its initial packet
-                handler.postDelayed({ sendHandshake(g) }, 2000) 
+                // Wait 1 second before handshake to let the bike process the wake-up
+                handler.postDelayed({ sendHandshake(g) }, 1000) 
             }
         }
 
@@ -163,7 +177,8 @@ class BleService : Service() {
                     NotificationLogger.info("Handshake sent: ${status == BluetoothGatt.GATT_SUCCESS}")
                     if (status == BluetoothGatt.GATT_SUCCESS) {
                         isHandshakeSent = true
-                        handler.postDelayed({ startKeepalive(g) }, 100) 
+                        // Wait 500ms after handshake, then start keepalive
+                        handler.postDelayed({ startKeepalive(g) }, 500) 
                     }
                 }
             }
@@ -176,6 +191,7 @@ class BleService : Service() {
     }
 
     private fun sendHandshake(g: BluetoothGatt) {
+        if (isHandshakeSent) return
         val ch = writeChar ?: return
         ch.value = hexToBytes(HANDSHAKE_HEX)
         val queued = g.writeCharacteristic(ch)
@@ -192,7 +208,7 @@ class BleService : Service() {
                 val ch = writeChar ?: return
                 ch.value = hexToBytes(KEEPALIVE_HEX)
                 g.writeCharacteristic(ch)
-                handler.postDelayed(this, 250) // 250ms loop
+                handler.postDelayed(this, 300) // 300ms loop
             }
         }
         handler.post(runnable)
