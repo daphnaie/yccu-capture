@@ -121,9 +121,23 @@ class BleService : Service() {
                 return
             }
 
-            // Save to properties for the callbacks
             writeChar = wc
             notifyChar = nc
+
+            // Poke EVERY writable characteristic with 01 00 (wakes up handle 0x0010)
+            for (svc in g.services) {
+                for (ch in svc.characteristics) {
+                    if (ch.properties and BluetoothGattCharacteristic.PROPERTY_WRITE != 0 ||
+                        ch.properties and BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE != 0) {
+                        
+                        if (ch.uuid != CHAR_WRITE_UUID) {
+                            ch.value = byteArrayOf(0x01, 0x00)
+                            g.writeCharacteristic(ch)
+                            NotificationLogger.info("Poked ${ch.uuid} with 01 00")
+                        }
+                    }
+                }
+            }
 
             // Step 1: Subscribe
             g.setCharacteristicNotification(nc, true)
@@ -132,16 +146,14 @@ class BleService : Service() {
                 cccd.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
                 g.writeDescriptor(cccd)
                 NotificationLogger.info("Subscribing to notifications...")
-            } else {
-                NotificationLogger.info("CCCD not found, forcing handshake...")
-                sendHandshake(g)
             }
         }
 
         override fun onDescriptorWrite(g: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int) {
             NotificationLogger.info("Subscribed: ${status == BluetoothGatt.GATT_SUCCESS}")
             if (status == BluetoothGatt.GATT_SUCCESS) {
-                handler.postDelayed({ sendHandshake(g) }, 200) 
+                // Wait 2 seconds before handshake to let the bike send its initial packet
+                handler.postDelayed({ sendHandshake(g) }, 2000) 
             }
         }
 
@@ -180,7 +192,7 @@ class BleService : Service() {
                 val ch = writeChar ?: return
                 ch.value = hexToBytes(KEEPALIVE_HEX)
                 g.writeCharacteristic(ch)
-                handler.postDelayed(this, 300)
+                handler.postDelayed(this, 250) // 250ms loop
             }
         }
         handler.post(runnable)
