@@ -34,6 +34,11 @@ class BleService : Service() {
     private var gatt: BluetoothGatt? = null
     private var scanner: android.bluetooth.le.BluetoothLeScanner? = null
     private val handler = Handler(Looper.getMainLooper())
+    
+    // State machine variables
+    private var writeChar: BluetoothGattCharacteristic? = null
+    private var notifyChar: BluetoothGattCharacteristic? = null
+    private var isHandshakeSent = false
     private var keepaliveRunning = false
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -45,19 +50,23 @@ class BleService : Service() {
     }
 
     override fun onDestroy() {
+        stopAll()
+        super.onDestroy()
+    }
+
+    private fun stopAll() {
         keepaliveRunning = false
+        isHandshakeSent = false
         handler.removeCallbacksAndMessages(null)
         try { scanner?.stopScan(scanCb) } catch (_: Exception) {}
         gatt?.close()
-        super.onDestroy()
+        gatt = null
     }
 
     private fun buildNotification(): Notification {
         if (Build.VERSION.SDK_INT >= 26) {
             val mgr = getSystemService(NotificationManager::class.java)
-            mgr.createNotificationChannel(
-                NotificationChannel(CH_ID, CH_NAME, NotificationManager.IMPORTANCE_LOW)
-            )
+            mgr.createNotificationChannel(NotificationChannel(CH_ID, CH_NAME, NotificationManager.IMPORTANCE_LOW))
         }
         return Notification.Builder(this, CH_ID)
             .setContentTitle("YCCU Capture")
@@ -70,9 +79,7 @@ class BleService : Service() {
         val mgr = getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
         val adapter = mgr.adapter ?: return
         scanner = adapter.bluetoothLeScanner
-        val settings = ScanSettings.Builder()
-            .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
-            .build()
+        val settings = ScanSettings.Builder().setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY).build()
         NotificationLogger.info("Scanning…")
         scanner?.startScan(null, settings, scanCb)
     }
@@ -100,46 +107,52 @@ class BleService : Service() {
                 g.discoverServices()
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                 NotificationLogger.info("Disconnected")
-                keepaliveRunning = false
-                handler.removeCallbacksAndMessages(null)
+                stopAll()
             }
         }
 
         override fun onServicesDiscovered(g: BluetoothGatt, status: Int) {
             NotificationLogger.info("Services discovered, status=$status")
             
-            // Wait 500ms before writing to let the bike settle
-            handler.postDelayed({
-                val writeChar = g.getService(SERVICE_UUID)?.getCharacteristic(CHAR_WRITE_UUID)
-                val notifyChar = g.getService(SERVICE_UUID)?.getCharacteristic(CHAR_NOTIFY_UUID)
+            writeChar = g.getService(SERVICE_UUID)?.getCharacteristic(CHAR_WRITE_UUID)
+            notifyChar = g.getService(SERVICE_UUID)?.getCharacteristic(CHAR_NOTIFY_UUID)
 
-                if (writeChar == null || notifyChar == null) {
-                    NotificationLogger.info("ERROR: Yamaha characteristics not found")
-                    return@postDelayed
-                }
+            if (writeChar == null || notifyChar == null) {
+                NotificationLogger.info("ERROR: Yamaha chars not found")
+                return
+            }
 
-                // 1. Subscribe
-                g.setCharacteristicNotification(notifyChar, true)
-                val cccd = notifyChar.getDescriptor(CCCD)
-                if (cccd != null) {
-                    cccd.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-                    val ok = g.writeDescriptor(cccd)
-                    NotificationLogger.info("Subscribed: $ok")
-                }
-
-                // 2. Handshake
-                writeChar.value = hexToBytes(HANDSHAKE_HEX)
-                val hOk = g.writeCharacteristic(writeChar)
-                NotificationLogger.info("Handshake sent: $hOk")
-
-                // 3. Keepalive
-                startKeepalive(g, writeChar)
-            }, 500) // 500ms delay
+            // Step 1: Subscribe
+            g.setCharacteristicNotification(notifyChar, true)
+            val cccd = notifyChar.getDescriptor(CCCD)
+            if (cccd != null) {
+                cccd.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+                g.writeDescriptor(cccd)
+                NotificationLogger.info("Subscribing to notifications...")
+            } else {
+                NotificationLogger.info("CCCD not found, forcing handshake...")
+                sendHandshake(g)
+            }
         }
 
-        override fun onCharacteristicWrite(g: BluetoothGatt?, ch: BluetoothGattCharacteristic?, status: Int) {
-            if (status != BluetoothGatt.GATT_SUCCESS) {
-                NotificationLogger.info("Write FAILED on ${ch?.uuid}: status=$status")
+        override fun onDescriptorWrite(g: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int) {
+            NotificationLogger.info("Subscribed: ${status == BluetoothGatt.GATT_SUCCESS}")
+            if (status == BluetoothGatt.GATT_SUCCESS) {
+                // Step 2: Handshake (only after subscription succeeds)
+                handler.postDelayed({ sendHandshake(g) }, 200) // 200ms safety delay
+            }
+        }
+
+        override fun onCharacteristicWrite(g: BluetoothGatt, ch: BluetoothGattCharacteristic, status: Int) {
+            if (ch.uuid == CHAR_WRITE_UUID) {
+                if (!isHandshakeSent) {
+                    NotificationLogger.info("Handshake sent: ${status == BluetoothGatt.GATT_SUCCESS}")
+                    if (status == BluetoothGatt.GATT_SUCCESS) {
+                        isHandshakeSent = true
+                        // Step 3: Start keepalive (only after handshake succeeds)
+                        handler.postDelayed({ startKeepalive(g) }, 100) 
+                    }
+                }
             }
         }
 
@@ -149,16 +162,24 @@ class BleService : Service() {
         }
     }
 
-    private fun startKeepalive(g: BluetoothGatt, ch: BluetoothGattCharacteristic) {
+    private fun sendHandshake(g: BluetoothGatt) {
+        val ch = writeChar ?: return
+        ch.value = hexToBytes(HANDSHAKE_HEX)
+        val queued = g.writeCharacteristic(ch)
+        NotificationLogger.info("Queued handshake: $queued")
+    }
+
+    private fun startKeepalive(g: BluetoothGatt) {
         if (keepaliveRunning) return
         keepaliveRunning = true
         
         val runnable = object : Runnable {
             override fun run() {
                 if (!keepaliveRunning) return
+                val ch = writeChar ?: return
                 ch.value = hexToBytes(KEEPALIVE_HEX)
                 g.writeCharacteristic(ch)
-                handler.postDelayed(this, 300) // 300ms
+                handler.postDelayed(this, 300) // Loop every 300ms
             }
         }
         handler.post(runnable)
