@@ -28,11 +28,11 @@ jobs:
           yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses 2>/dev/null || \
           yes | $ANDROID_HOME/tools/bin/sdkmanager --licenses || true
 
-      - name: Grant execute permission for gradlew
-        run: chmod +x gradlew || true
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
 
       - name: Build debug APK
-        run: ./gradlew assembleDebug --stacktrace
+        run: gradle assembleDebug --stacktrace
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
