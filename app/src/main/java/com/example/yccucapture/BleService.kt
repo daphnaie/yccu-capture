@@ -113,7 +113,6 @@ class BleService : Service() {
         override fun onServicesDiscovered(g: BluetoothGatt, status: Int) {
             NotificationLogger.info("Services discovered, status=$status")
             
-            // Find ONLY the Yamaha service
             val yamahaService = g.getService(SERVICE_UUID)
             if (yamahaService == null) {
                 NotificationLogger.info("ERROR: Yamaha service not found")
@@ -131,24 +130,17 @@ class BleService : Service() {
             writeChar = wc
             notifyChar = nc
 
-            // 1. Send the 01 00 wake-up (Time Sync / Session Init)
-            var wakeUpSent = false
-            for (ch in yamahaService.characteristics) {
-                if (ch.properties and BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE != 0 ||
-                    ch.properties and BluetoothGattCharacteristic.PROPERTY_WRITE != 0) {
-                    
-                    if (ch.uuid != CHAR_WRITE_UUID) {
-                        ch.value = byteArrayOf(0x01, 0x00)
-                        g.writeCharacteristic(ch)
-                        NotificationLogger.info("Sent 01 00 wake-up to ${ch.uuid}")
-                        wakeUpSent = true
-                    }
-                }
-            }
-            
-            if (!wakeUpSent) {
-                 NotificationLogger.info("Warning: No wake-up characteristic found!")
-            }
+            // 1. WAKE-UP: Write 01 00 directly to handle 0x0010
+            // We construct a dummy characteristic to target the specific handle from the Wireshark log.
+            val dummyChar = BluetoothGattCharacteristic(
+                UUID.fromString("00002a05-0000-1000-8000-00805f9b34fb"), // Service Changed UUID
+                BluetoothGattCharacteristic.PROPERTY_WRITE,
+                BluetoothGattCharacteristic.PERMISSION_WRITE
+            )
+            dummyChar.instanceId = 0x0010 // Force the handle to 0x0010
+            dummyChar.value = byteArrayOf(0x01, 0x00)
+            val wakeQueued = g.writeCharacteristic(dummyChar)
+            NotificationLogger.info("Wake-up 01 00 to handle 0x0010 queued: $wakeQueued")
 
             // 2. Subscribe to Notifications
             g.setCharacteristicNotification(nc, true)
@@ -159,15 +151,14 @@ class BleService : Service() {
                 NotificationLogger.info("Subscribing to notifications...")
             }
             
-            // 3. Handshake fallback timer (in case onDescriptorWrite doesn't fire)
-            handler.postDelayed({ sendHandshake(g) }, 1500)
+            // 3. Handshake timer
+            handler.postDelayed({ sendHandshake(g) }, 1000)
         }
 
         override fun onDescriptorWrite(g: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int) {
             NotificationLogger.info("Subscribed: ${status == BluetoothGatt.GATT_SUCCESS}")
             if (status == BluetoothGatt.GATT_SUCCESS) {
-                // Wait 1 second before handshake to let the bike process the wake-up
-                handler.postDelayed({ sendHandshake(g) }, 1000) 
+                handler.postDelayed({ sendHandshake(g) }, 500) 
             }
         }
 
@@ -177,8 +168,7 @@ class BleService : Service() {
                     NotificationLogger.info("Handshake sent: ${status == BluetoothGatt.GATT_SUCCESS}")
                     if (status == BluetoothGatt.GATT_SUCCESS) {
                         isHandshakeSent = true
-                        // Wait 500ms after handshake, then start keepalive
-                        handler.postDelayed({ startKeepalive(g) }, 500) 
+                        handler.postDelayed({ startKeepalive(g) }, 300) 
                     }
                 }
             }
@@ -208,7 +198,7 @@ class BleService : Service() {
                 val ch = writeChar ?: return
                 ch.value = hexToBytes(KEEPALIVE_HEX)
                 g.writeCharacteristic(ch)
-                handler.postDelayed(this, 300) // 300ms loop
+                handler.postDelayed(this, 300) 
             }
         }
         handler.post(runnable)
