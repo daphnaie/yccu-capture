@@ -130,17 +130,23 @@ class BleService : Service() {
             writeChar = wc
             notifyChar = nc
 
-            // 1. WAKE-UP: Write 01 00 directly to handle 0x0010
-            // We construct a dummy characteristic to target the specific handle from the Wireshark log.
+            // 1. WAKE-UP: Write 01 00 directly to handle 0x0010 using reflection
             val dummyChar = BluetoothGattCharacteristic(
                 UUID.fromString("00002a05-0000-1000-8000-00805f9b34fb"), // Service Changed UUID
                 BluetoothGattCharacteristic.PROPERTY_WRITE,
                 BluetoothGattCharacteristic.PERMISSION_WRITE
             )
-            dummyChar.instanceId = 0x0010 // Force the handle to 0x0010
-            dummyChar.value = byteArrayOf(0x01, 0x00)
-            val wakeQueued = g.writeCharacteristic(dummyChar)
-            NotificationLogger.info("Wake-up 01 00 to handle 0x0010 queued: $wakeQueued")
+            try {
+                val field = BluetoothGattCharacteristic::class.java.getDeclaredField("mInstanceId")
+                field.isAccessible = true
+                field.setInt(dummyChar, 0x0010) // Force the handle to 0x0010
+                
+                dummyChar.value = byteArrayOf(0x01, 0x00)
+                val wakeQueued = g.writeCharacteristic(dummyChar)
+                NotificationLogger.info("Wake-up to 0x0010 queued: $wakeQueued")
+            } catch (e: Exception) {
+                NotificationLogger.info("Reflection failed: ${e.message}")
+            }
 
             // 2. Subscribe to Notifications
             g.setCharacteristicNotification(nc, true)
