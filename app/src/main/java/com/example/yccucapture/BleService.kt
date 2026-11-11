@@ -116,19 +116,15 @@ class BleService : Service() {
         override fun onServicesDiscovered(g: BluetoothGatt, status: Int) {
             NotificationLogger.info("Services discovered, status=$status")
             
-            // 1. Find and poke Service Changed (Handle 0x0010) with 01 00
-            val gapService = g.getService(SERVICE_GAP)
-            val serviceChangedChar = gapService?.getCharacteristic(CHAR_SERVICE_CHANGED)
-            
-            if (serviceChangedChar != null) {
-                serviceChangedChar.value = byteArrayOf(0x01, 0x00)
-                val poked = g.writeCharacteristic(serviceChangedChar)
-                NotificationLogger.info("Poked Service Changed with 01 00: $poked")
-            } else {
-                NotificationLogger.info("Service Changed char not found")
+            // Dump everything
+            for (svc in g.services) {
+                NotificationLogger.info("Service: ${svc.uuid}")
+                for (ch in svc.characteristics) {
+                    NotificationLogger.info("  Char: ${ch.uuid} | Handle: ${ch.instanceId} | Props: ${ch.properties}")
+                }
             }
 
-            // 2. Setup Yamaha media chars
+            // Setup Yamaha media chars
             val yamahaService = g.getService(SERVICE_YAMAHA)
             if (yamahaService == null) {
                 NotificationLogger.info("ERROR: Yamaha service not found")
@@ -146,16 +142,13 @@ class BleService : Service() {
             writeChar = wc
             notifyChar = nc
 
-            // 3. Subscribe to Notifications
             g.setCharacteristicNotification(nc, true)
             val cccd = nc.getDescriptor(CCCD)
             if (cccd != null) {
                 cccd.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
                 g.writeDescriptor(cccd)
-                NotificationLogger.info("Subscribing to notifications...")
             }
             
-            // 4. Handshake timer
             handler.postDelayed({ sendHandshake(g) }, 1000)
         }
 
