@@ -23,7 +23,10 @@ class BleService : Service() {
         private const val CH_NAME = "YCCU Capture"
         
         private val CCCD = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
-        private val SERVICE_UUID = UUID.fromString("6e400001-b5a3-f393-e0a9-e50e24dcca9e")
+        private val SERVICE_GAP = UUID.fromString("00001801-0000-1000-8000-00805f9b34fb") // Generic Attribute
+        private val CHAR_SERVICE_CHANGED = UUID.fromString("00002a05-0000-1000-8000-00805f9b34fb") // Service Changed
+        
+        private val SERVICE_YAMAHA = UUID.fromString("6e400001-b5a3-f393-e0a9-e50e24dcca9e")
         private val CHAR_WRITE_UUID = UUID.fromString("6e400002-b5a3-f393-e0a9-e50e24dcca9e")
         private val CHAR_NOTIFY_UUID = UUID.fromString("6e400003-b5a3-f393-e0a9-e50e24dcca9e")
 
@@ -113,7 +116,20 @@ class BleService : Service() {
         override fun onServicesDiscovered(g: BluetoothGatt, status: Int) {
             NotificationLogger.info("Services discovered, status=$status")
             
-            val yamahaService = g.getService(SERVICE_UUID)
+            // 1. Find and poke Service Changed (Handle 0x0010) with 01 00
+            val gapService = g.getService(SERVICE_GAP)
+            val serviceChangedChar = gapService?.getCharacteristic(CHAR_SERVICE_CHANGED)
+            
+            if (serviceChangedChar != null) {
+                serviceChangedChar.value = byteArrayOf(0x01, 0x00)
+                val poked = g.writeCharacteristic(serviceChangedChar)
+                NotificationLogger.info("Poked Service Changed with 01 00: $poked")
+            } else {
+                NotificationLogger.info("Service Changed char not found")
+            }
+
+            // 2. Setup Yamaha media chars
+            val yamahaService = g.getService(SERVICE_YAMAHA)
             if (yamahaService == null) {
                 NotificationLogger.info("ERROR: Yamaha service not found")
                 return
@@ -130,25 +146,7 @@ class BleService : Service() {
             writeChar = wc
             notifyChar = nc
 
-            // 1. WAKE-UP: Write 01 00 directly to handle 0x0010 using reflection
-            val dummyChar = BluetoothGattCharacteristic(
-                UUID.fromString("00002a05-0000-1000-8000-00805f9b34fb"), // Service Changed UUID
-                BluetoothGattCharacteristic.PROPERTY_WRITE,
-                BluetoothGattCharacteristic.PERMISSION_WRITE
-            )
-            try {
-                val field = BluetoothGattCharacteristic::class.java.getDeclaredField("mInstanceId")
-                field.isAccessible = true
-                field.setInt(dummyChar, 0x0010) // Force the handle to 0x0010
-                
-                dummyChar.value = byteArrayOf(0x01, 0x00)
-                val wakeQueued = g.writeCharacteristic(dummyChar)
-                NotificationLogger.info("Wake-up to 0x0010 queued: $wakeQueued")
-            } catch (e: Exception) {
-                NotificationLogger.info("Reflection failed: ${e.message}")
-            }
-
-            // 2. Subscribe to Notifications
+            // 3. Subscribe to Notifications
             g.setCharacteristicNotification(nc, true)
             val cccd = nc.getDescriptor(CCCD)
             if (cccd != null) {
@@ -157,7 +155,7 @@ class BleService : Service() {
                 NotificationLogger.info("Subscribing to notifications...")
             }
             
-            // 3. Handshake timer
+            // 4. Handshake timer
             handler.postDelayed({ sendHandshake(g) }, 1000)
         }
 
