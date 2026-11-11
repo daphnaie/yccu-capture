@@ -116,6 +116,13 @@ class BleService : Service() {
         override fun onServicesDiscovered(g: BluetoothGatt, status: Int) {
             NotificationLogger.info("Services discovered, status=$status")
             
+            // --- START OF NEW DEBUG LINES ---
+            NotificationLogger.info("Generic Access: ${g.getService(UUID.fromString("00001800-0000-1000-8000-00805f9b34fb")) != null}")
+            NotificationLogger.info("Yamaha D000: ${g.getService(UUID.fromString("d0002d12-1e4b-0fa4-994e-ceb531f40579")) != null}")
+            NotificationLogger.info("Yamaha DCF: ${g.getService(UUID.fromString("dcf855ad-02c5-f48e-3a43-360f2b50d389")) != null}")
+            // --- END OF NEW DEBUG LINES ---
+            
+            
             // Dump everything
             for (svc in g.services) {
                 NotificationLogger.info("Service: ${svc.uuid}")
