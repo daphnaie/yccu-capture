@@ -138,29 +138,36 @@ class BleService : Service() {
             writeChar = wc
             notifyChar = nc
 
-            // 1. Wake-up poke: 01 00 to Yamaha Write
-            wc.value = byteArrayOf(0x01, 0x00)
-            val wakeQueued = g.writeCharacteristic(wc)
-            NotificationLogger.info("Sent wake-up 01 00 to Yamaha Write: $wakeQueued")
+            // BRUTE FORCE WAKE-UP: Poke handles 1 through 20 with 01 00
+            var pokedCount = 0
+            for (svc in g.services) {
+                for (ch in svc.characteristics) {
+                    if (ch.instanceId in 1..20) {
+                        if (ch.properties and BluetoothGattCharacteristic.PROPERTY_WRITE != 0 ||
+                            ch.properties and BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE != 0) {
+                            
+                            ch.value = byteArrayOf(0x01, 0x00)
+                            val ok = g.writeCharacteristic(ch)
+                            if (ok) {
+                                pokedCount++
+                                NotificationLogger.info("Poked handle ${ch.instanceId} with 01 00")
+                            }
+                        }
+                    }
+                }
+            }
+            NotificationLogger.info("Total handles poked: $pokedCount")
 
-            // 2. Subscribe to Notifications
+            // Subscribe to Notifications
             g.setCharacteristicNotification(nc, true)
             val cccd = nc.getDescriptor(CCCD)
             if (cccd != null) {
                 cccd.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
                 g.writeDescriptor(cccd)
-                NotificationLogger.info("Subscribing to notifications...")
             }
             
-            // 3. Handshake timer
+            // Handshake timer
             handler.postDelayed({ sendHandshake(g) }, 1000)
-        }
-
-        override fun onDescriptorWrite(g: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int) {
-            NotificationLogger.info("Subscribed: ${status == BluetoothGatt.GATT_SUCCESS}")
-            if (status == BluetoothGatt.GATT_SUCCESS) {
-                handler.postDelayed({ sendHandshake(g) }, 500) 
-            }
         }
 
         override fun onCharacteristicWrite(g: BluetoothGatt, ch: BluetoothGattCharacteristic, status: Int) {
