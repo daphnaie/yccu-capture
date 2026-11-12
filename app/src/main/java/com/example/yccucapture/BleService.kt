@@ -39,6 +39,7 @@ class BleService : Service() {
     private var notifyChar: BluetoothGattCharacteristic? = null
     private var isHandshakeSent = false
     private var keepaliveRunning = false
+    private var mtuRequested = false
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -103,19 +104,12 @@ class BleService : Service() {
         override fun onConnectionStateChange(g: BluetoothGatt, status: Int, newState: Int) {
             NotificationLogger.info("State change: status=$status newState=$newState")
             if (newState == BluetoothProfile.STATE_CONNECTED) {
-                // Request a large MTU so we can send the 124-byte keepalives without truncation
-                val mtuRequested = g.requestMtu(247)
-                NotificationLogger.info("Requested MTU 247: $mtuRequested")
+                // Do NOT request MTU yet. Wait for services.
+                g.discoverServices()
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                 NotificationLogger.info("Disconnected")
                 stopAll()
             }
-        }
-
-        override fun onMtuChanged(g: BluetoothGatt, mtu: Int, status: Int) {
-            NotificationLogger.info("MTU changed to $mtu, status: $status")
-            // Now that we have a large MTU, we can safely discover services
-            g.discoverServices()
         }
 
         override fun onServicesDiscovered(g: BluetoothGatt, status: Int) {
@@ -138,36 +132,47 @@ class BleService : Service() {
             writeChar = wc
             notifyChar = nc
 
-            // BRUTE FORCE WAKE-UP: Poke handles 1 through 20 with 01 00
-            var pokedCount = 0
-            for (svc in g.services) {
-                for (ch in svc.characteristics) {
-                    if (ch.instanceId in 1..20) {
-                        if (ch.properties and BluetoothGattCharacteristic.PROPERTY_WRITE != 0 ||
-                            ch.properties and BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE != 0) {
-                            
-                            ch.value = byteArrayOf(0x01, 0x00)
-                            val ok = g.writeCharacteristic(ch)
-                            if (ok) {
-                                pokedCount++
-                                NotificationLogger.info("Poked handle ${ch.instanceId} with 01 00")
-                            }
-                        }
-                    }
-                }
+            // 1. Write 01 00 to Handle 0x0010 (Reflection Hack)
+            val dummyChar = BluetoothGattCharacteristic(
+                UUID.fromString("00002a05-0000-1000-8000-00805f9b34fb"), 
+                BluetoothGattCharacteristic.PROPERTY_WRITE,
+                BluetoothGattCharacteristic.PERMISSION_WRITE
+            )
+            try {
+                val field = BluetoothGattCharacteristic::class.java.getDeclaredField("mInstanceId")
+                field.isAccessible = true
+                field.setInt(dummyChar, 0x0010)
+                
+                dummyChar.value = byteArrayOf(0x01, 0x00)
+                dummyChar.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT // Write Request!
+                val wakeQueued = g.writeCharacteristic(dummyChar)
+                NotificationLogger.info("Wake-up to 0x0010 queued: $wakeQueued")
+            } catch (e: Exception) {
+                NotificationLogger.info("Reflection failed: ${e.message}")
             }
-            NotificationLogger.info("Total handles poked: $pokedCount")
+            
+            // 2. Request MTU right after the wake-up
+            handler.postDelayed({
+                NotificationLogger.info("Requesting MTU 247 now...")
+                g.requestMtu(247)
+            }, 300)
+        }
 
-            // Subscribe to Notifications
+        override fun onMtuChanged(g: BluetoothGatt, mtu: Int, status: Int) {
+            NotificationLogger.info("MTU changed to $mtu, status: $status")
+            
+            // 3. Subscribe to notifications
+            val nc = notifyChar ?: return
             g.setCharacteristicNotification(nc, true)
             val cccd = nc.getDescriptor(CCCD)
             if (cccd != null) {
                 cccd.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
                 g.writeDescriptor(cccd)
+                NotificationLogger.info("Subscribing to notifications...")
             }
             
-            // Handshake timer
-            handler.postDelayed({ sendHandshake(g) }, 1000)
+            // 4. Send handshake
+            handler.postDelayed({ sendHandshake(g) }, 300)
         }
 
         override fun onCharacteristicWrite(g: BluetoothGatt, ch: BluetoothGattCharacteristic, status: Int) {
