@@ -23,9 +23,6 @@ class BleService : Service() {
         private const val CH_NAME = "YCCU Capture"
         
         private val CCCD = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
-        private val SERVICE_GAP = UUID.fromString("00001801-0000-1000-8000-00805f9b34fb") // Generic Attribute
-        private val CHAR_SERVICE_CHANGED = UUID.fromString("00002a05-0000-1000-8000-00805f9b34fb") // Service Changed
-        
         private val SERVICE_YAMAHA = UUID.fromString("6e400001-b5a3-f393-e0a9-e50e24dcca9e")
         private val CHAR_WRITE_UUID = UUID.fromString("6e400002-b5a3-f393-e0a9-e50e24dcca9e")
         private val CHAR_NOTIFY_UUID = UUID.fromString("6e400003-b5a3-f393-e0a9-e50e24dcca9e")
@@ -106,11 +103,19 @@ class BleService : Service() {
         override fun onConnectionStateChange(g: BluetoothGatt, status: Int, newState: Int) {
             NotificationLogger.info("State change: status=$status newState=$newState")
             if (newState == BluetoothProfile.STATE_CONNECTED) {
-                g.discoverServices()
+                // Request a large MTU so we can send the 124-byte keepalives without truncation
+                val mtuRequested = g.requestMtu(247)
+                NotificationLogger.info("Requested MTU 247: $mtuRequested")
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                 NotificationLogger.info("Disconnected")
                 stopAll()
             }
+        }
+
+        override fun onMtuChanged(g: BluetoothGatt, mtu: Int, status: Int) {
+            NotificationLogger.info("MTU changed to $mtu, status: $status")
+            // Now that we have a large MTU, we can safely discover services
+            g.discoverServices()
         }
 
         override fun onServicesDiscovered(g: BluetoothGatt, status: Int) {
@@ -133,7 +138,7 @@ class BleService : Service() {
             writeChar = wc
             notifyChar = nc
 
-            // 1. Send 01 00 to the Yamaha Write characteristic (The Wake-up)
+            // 1. Wake-up poke: 01 00 to Yamaha Write
             wc.value = byteArrayOf(0x01, 0x00)
             val wakeQueued = g.writeCharacteristic(wc)
             NotificationLogger.info("Sent wake-up 01 00 to Yamaha Write: $wakeQueued")
@@ -147,8 +152,8 @@ class BleService : Service() {
                 NotificationLogger.info("Subscribing to notifications...")
             }
             
-            // 3. Handshake timer (Give the bike 1.5s to process the wake-up)
-            handler.postDelayed({ sendHandshake(g) }, 1500)
+            // 3. Handshake timer
+            handler.postDelayed({ sendHandshake(g) }, 1000)
         }
 
         override fun onDescriptorWrite(g: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int) {
