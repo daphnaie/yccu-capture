@@ -97,25 +97,54 @@ class BleService : Service() {
             }
         }
 
-        override fun onCharacteristicChanged(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
-            val data = characteristic.value
-            val hexString = data.joinToString("") { "%02x".format(it) }
-            Log.d(TAG, "RECV: $hexString")
+override fun onCharacteristicChanged(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
+    val data = characteristic.value
+    val hexString = data.joinToString("") { "%02x".format(it) }
+    Log.d(TAG, "RECV: $hexString")
 
-            // ==========================================
-            // BUTTON PARSER (Placeholder - update with Snoop 3)
-            // ==========================================
-            if (data.size < 50) {
-                // This is likely a button press or status packet.
-                // We will update this mapping once you capture Snoop 3.
-                when (data[0]) {
-                    0x01.toByte() -> dispatchMediaKey(KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE)
-                    0x02.toByte() -> dispatchMediaKey(KeyEvent.KEYCODE_MEDIA_NEXT)
-                    0x03.toByte() -> dispatchMediaKey(KeyEvent.KEYCODE_MEDIA_PREVIOUS)
-                }
-            }
+    if (data.size < 50) {
+        when (data[0].toInt()) {
+            0x01 -> dispatchMediaKey(KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE)
+            0x02 -> dispatchMediaKey(KeyEvent.KEYCODE_MEDIA_NEXT)
+            0x03 -> dispatchMediaKey(KeyEvent.KEYCODE_MEDIA_PREVIOUS)
         }
     }
+}
+
+fun sendMetadata(title: String, artist: String, album: String) {
+    if (writeCharacteristic == null) return
+
+    val buffer = ByteArrayOutputStream()
+
+    val prefix = intArrayOf(
+        0x62, 0x07, 0x05, 0x8a, 0x08, 0x07, 0xea, 0x0b,
+        0x0a, 0x04, 0x0f, 0x38, 0x8a, 0x05, 0x8b, 0x08,
+        0x00, 0x00, 0x00, 0x55, 0x55, 0x55, 0x55, 0x30
+    ).map { it.toByte() }.toByteArray()
+    buffer.write(prefix)
+
+    buffer.write(artist.toByteArray(Charsets.UTF_16LE))
+    buffer.write(byteArrayOf(0x00, 0x00))
+
+    buffer.write(title.toByteArray(Charsets.UTF_16LE))
+    buffer.write(byteArrayOf(0x00, 0x00))
+
+    buffer.write(album.toByteArray(Charsets.UTF_16LE))
+    buffer.write(byteArrayOf(0x00, 0x00))
+
+    val suffix = intArrayOf(
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x9c, 0x1e, 0x00,
+        0x42, 0x00, 0x69, 0x00, 0x67, 0x00, 0x20, 0x00, 0x59, 0x00,
+        0x65, 0x00, 0x6c, 0x00, 0x6c, 0x00, 0x6f, 0x00, 0x77
+    ).map { it.toByte() }.toByteArray()
+    buffer.write(suffix)
+
+    writeCharacteristic?.let {
+        it.value = buffer.toByteArray()
+        bluetoothGatt?.writeCharacteristic(it)
+        Log.d(TAG, "Sent Metadata: $artist - $title")
+    }
+}
 
     private fun sendHandshake() {
         // Frame 482: Write Request, Value 0100 to Handle 0x0010
