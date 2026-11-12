@@ -116,22 +116,6 @@ class BleService : Service() {
         override fun onServicesDiscovered(g: BluetoothGatt, status: Int) {
             NotificationLogger.info("Services discovered, status=$status")
             
-            // --- START OF NEW DEBUG LINES ---
-            NotificationLogger.info("Generic Access: ${g.getService(UUID.fromString("00001800-0000-1000-8000-00805f9b34fb")) != null}")
-            NotificationLogger.info("Yamaha D000: ${g.getService(UUID.fromString("d0002d12-1e4b-0fa4-994e-ceb531f40579")) != null}")
-            NotificationLogger.info("Yamaha DCF: ${g.getService(UUID.fromString("dcf855ad-02c5-f48e-3a43-360f2b50d389")) != null}")
-            // --- END OF NEW DEBUG LINES ---
-            
-            
-            // Dump everything
-            for (svc in g.services) {
-                NotificationLogger.info("Service: ${svc.uuid}")
-                for (ch in svc.characteristics) {
-                    NotificationLogger.info("  Char: ${ch.uuid} | Handle: ${ch.instanceId} | Props: ${ch.properties}")
-                }
-            }
-
-            // Setup Yamaha media chars
             val yamahaService = g.getService(SERVICE_YAMAHA)
             if (yamahaService == null) {
                 NotificationLogger.info("ERROR: Yamaha service not found")
@@ -149,14 +133,22 @@ class BleService : Service() {
             writeChar = wc
             notifyChar = nc
 
+            // 1. Send 01 00 to the Yamaha Write characteristic (The Wake-up)
+            wc.value = byteArrayOf(0x01, 0x00)
+            val wakeQueued = g.writeCharacteristic(wc)
+            NotificationLogger.info("Sent wake-up 01 00 to Yamaha Write: $wakeQueued")
+
+            // 2. Subscribe to Notifications
             g.setCharacteristicNotification(nc, true)
             val cccd = nc.getDescriptor(CCCD)
             if (cccd != null) {
                 cccd.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
                 g.writeDescriptor(cccd)
+                NotificationLogger.info("Subscribing to notifications...")
             }
             
-            handler.postDelayed({ sendHandshake(g) }, 1000)
+            // 3. Handshake timer (Give the bike 1.5s to process the wake-up)
+            handler.postDelayed({ sendHandshake(g) }, 1500)
         }
 
         override fun onDescriptorWrite(g: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int) {
