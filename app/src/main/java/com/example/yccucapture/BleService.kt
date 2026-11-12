@@ -4,67 +4,101 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
-import android.bluetooth.BluetoothGatt
-import android.bluetooth.BluetoothGattCallback
-import android.bluetooth.BluetoothGattCharacteristic
-import android.bluetooth.BluetoothGattDescriptor
-import android.bluetooth.BluetoothProfile
+import android.bluetooth.*
+import android.bluetooth.le.ScanCallback
+import android.bluetooth.le.ScanResult
+import android.bluetooth.le.ScanSettings
+import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.media.session.MediaSession
 import android.media.session.PlaybackState
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
-import android.util.Log
+import android.os.Looper
 import android.view.KeyEvent
-import java.io.ByteArrayOutputStream
 import java.util.UUID
 
 class BleService : Service() {
 
-    private val TAG = "YCCU_BLE"
+    companion object {
+        private const val CH_ID = "yccu"
+        private const val CH_NAME = "YCCU Capture"
+        
+        private val CCCD = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
+        private val SERVICE_YAMAHA = UUID.fromString("6e400001-b5a3-f393-e0a9-e50e24dcca9e")
+        private val CHAR_WRITE_UUID = UUID.fromString("6e400002-b5a3-f393-e0a9-e50e24dcca9e")
+        private val CHAR_NOTIFY_UUID = UUID.fromString("6e400003-b5a3-f393-e0a9-e50e24dcca9e")
 
-    private val SERVICE_YAMAHA = UUID.fromString("6e400001-b5a3-f393-e0a9-e50e24dcca9e")
-    private val CHAR_WRITE_UUID = UUID.fromString("6e400002-b5a3-f393-e0a9-e50e24dcca9e")
-    private val CHAR_NOTIFY_UUID = UUID.fromString("6e400003-b5a3-f393-e0a9-e50e24dcca9e")
-    private val CCCD = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
+        private const val HANDSHAKE_HEX = "aa017f0035303030303030303030303030303030303030303064383136353639303532383534663339383231613636326337366365353934630000f9"
+        private const val KEEPALIVE_HEX = "60050592080000000000000000000593080000000000000000059408fdff00fe5555555505953d00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000059808555555555555555598b1"
+    }
 
-    private var bluetoothGatt: BluetoothGatt? = null
-    private var writeCharacteristic: BluetoothGattCharacteristic? = null
+    private var gatt: BluetoothGatt? = null
+    private var scanner: android.bluetooth.le.BluetoothLeScanner? = null
+    private val handler = Handler(Looper.getMainLooper())
+    
+    private var writeChar: BluetoothGattCharacteristic? = null
+    private var notifyChar: BluetoothGattCharacteristic? = null
+    private var isHandshakeSent = false
+    private var keepaliveRunning = false
+    private var mtuRequested = false
 
-    private lateinit var mediaSession: MediaSession
+    // NEW: MediaSession to trick the bike into sending button packets
+    private var mediaSession: MediaSession? = null
+
+    override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onCreate() {
         super.onCreate()
-        createNotificationChannel()
-        startForegroundService()
-        setupMediaSession()
+        // FIX: Android 14+ requires the foreground service type
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            startForeground(
+                1,
+                buildNotification(),
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
+            )
+        } else {
+            startForeground(1, buildNotification())
+        }
+        setupMediaSession() // NEW
+        scan()
     }
 
-    private fun startForegroundService() {
-        val notification = Notification.Builder(this, "YCCU_CHANNEL")
-            .setContentTitle("YCCU Active")
+    override fun onDestroy() {
+        stopAll()
+        super.onDestroy()
+    }
+
+    private fun stopAll() {
+        keepaliveRunning = false
+        isHandshakeSent = false
+        handler.removeCallbacksAndMessages(null)
+        try { scanner?.stopScan(scanCb) } catch (_: Exception) {}
+        gatt?.close()
+        gatt = null
+        // NEW: release the media session
+        mediaSession?.isActive = false
+        mediaSession?.release()
+        mediaSession = null
+    }
+
+    private fun buildNotification(): Notification {
+        if (Build.VERSION.SDK_INT >= 26) {
+            val mgr = getSystemService(NotificationManager::class.java)
+            mgr.createNotificationChannel(NotificationChannel(CH_ID, CH_NAME, NotificationManager.IMPORTANCE_LOW))
+        }
+        return Notification.Builder(this, CH_ID)
+            .setContentTitle("YCCU Capture")
+            .setContentText("Scanning / connected")
             .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
             .build()
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(1, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE)
-        } else {
-            startForeground(1, notification)
-        }
     }
 
-    private fun createNotificationChannel() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(
-                "YCCU_CHANNEL",
-                "YCCU Service",
-                NotificationManager.IMPORTANCE_LOW
-            )
-            getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
-        }
-    }
-
+    // NEW: MediaSession setup
     private fun setupMediaSession() {
+        if (mediaSession != null) return
         mediaSession = MediaSession(this, "YCCUMediaSession").apply {
             setPlaybackState(
                 PlaybackState.Builder()
@@ -78,121 +112,171 @@ class BleService : Service() {
             )
             isActive = true
         }
+        NotificationLogger.info("MediaSession active")
     }
 
+    // NEW: send a media key to Android (Spotify/YT Music)
     private fun dispatchMediaKey(keyCode: Int) {
-        val intent = Intent(Intent.ACTION_MEDIA_BUTTON).apply {
+        val i = Intent(Intent.ACTION_MEDIA_BUTTON).apply {
             putExtra(Intent.EXTRA_KEY_EVENT, KeyEvent(KeyEvent.ACTION_DOWN, keyCode))
         }
-        sendBroadcast(intent)
-        Log.d(TAG, "Dispatched Media Key: $keyCode")
+        sendBroadcast(i)
+        NotificationLogger.info("Dispatched media key: $keyCode")
     }
 
-    private val gattCallback = object : BluetoothGattCallback() {
-        override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
+    private fun scan() {
+        val mgr = getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
+        val adapter = mgr.adapter ?: return
+        scanner = adapter.bluetoothLeScanner
+        val settings = ScanSettings.Builder().setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY).build()
+        NotificationLogger.info("Scanning…")
+        scanner?.startScan(null, settings, scanCb)
+    }
+
+    private val scanCb = object : ScanCallback() {
+        override fun onScanResult(callbackType: Int, result: ScanResult) {
+            val name = result.device.name ?: result.scanRecord?.deviceName ?: return
+            if (!name.uppercase().contains("YCCU")) return
+            NotificationLogger.info("Found $name (${result.device.address})")
+            scanner?.stopScan(this)
+            connect(result.device)
+        }
+    }
+
+    private fun connect(device: BluetoothDevice) {
+        NotificationLogger.info("Connecting to ${device.address}")
+        gatt = device.connectGatt(this, false, gattCb, BluetoothDevice.TRANSPORT_LE)
+    }
+
+    private val gattCb = object : BluetoothGattCallback() {
+
+        override fun onConnectionStateChange(g: BluetoothGatt, status: Int, newState: Int) {
+            NotificationLogger.info("State change: status=$status newState=$newState")
             if (newState == BluetoothProfile.STATE_CONNECTED) {
-                gatt.discoverServices()
+                // Do NOT request MTU yet. Wait for services.
+                g.discoverServices()
+            } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+                NotificationLogger.info("Disconnected")
+                stopAll()
             }
         }
 
-        override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
-            if (status == BluetoothGatt.GATT_SUCCESS) {
-                for (service in gatt.services) {
-                    for (char in service.characteristics) {
-                        if (char.uuid == CHAR_WRITE_UUID) {
-                            writeCharacteristic = char
-                        }
-                        if (char.uuid == CHAR_NOTIFY_UUID) {
-                            gatt.setCharacteristicNotification(char, true)
-                            val descriptor = char.getDescriptor(CCCD)
-                            descriptor?.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-                            gatt.writeDescriptor(descriptor)
-                        }
+        override fun onServicesDiscovered(g: BluetoothGatt, status: Int) {
+            NotificationLogger.info("Services discovered, status=$status")
+            
+            val yamahaService = g.getService(SERVICE_YAMAHA)
+            if (yamahaService == null) {
+                NotificationLogger.info("ERROR: Yamaha service not found")
+                return
+            }
+
+            val wc = yamahaService.getCharacteristic(CHAR_WRITE_UUID)
+            val nc = yamahaService.getCharacteristic(CHAR_NOTIFY_UUID)
+
+            if (wc == null || nc == null) {
+                NotificationLogger.info("ERROR: Yamaha chars not found")
+                return
+            }
+
+            writeChar = wc
+            notifyChar = nc
+
+            // 1. Write 01 00 to Handle 0x0010 (Reflection Hack)
+            val dummyChar = BluetoothGattCharacteristic(
+                UUID.fromString("00002a05-0000-1000-8000-00805f9b34fb"), 
+                BluetoothGattCharacteristic.PROPERTY_WRITE,
+                BluetoothGattCharacteristic.PERMISSION_WRITE
+            )
+            try {
+                val field = BluetoothGattCharacteristic::class.java.getDeclaredField("mInstanceId")
+                field.isAccessible = true
+                field.setInt(dummyChar, 0x0010)
+                
+                dummyChar.value = byteArrayOf(0x01, 0x00)
+                dummyChar.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT // Write Request!
+                val wakeQueued = g.writeCharacteristic(dummyChar)
+                NotificationLogger.info("Wake-up to 0x0010 queued: $wakeQueued")
+            } catch (e: Exception) {
+                NotificationLogger.info("Reflection failed: ${e.message}")
+            }
+            
+            // 2. Request MTU right after the wake-up
+            handler.postDelayed({
+                NotificationLogger.info("Requesting MTU 247 now...")
+                g.requestMtu(247)
+            }, 300)
+        }
+
+        override fun onMtuChanged(g: BluetoothGatt, mtu: Int, status: Int) {
+            NotificationLogger.info("MTU changed to $mtu, status: $status")
+            
+            // 3. Subscribe to notifications
+            val nc = notifyChar ?: return
+            g.setCharacteristicNotification(nc, true)
+            val cccd = nc.getDescriptor(CCCD)
+            if (cccd != null) {
+                cccd.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+                g.writeDescriptor(cccd)
+                NotificationLogger.info("Subscribing to notifications...")
+            }
+            
+            // 4. Send handshake
+            handler.postDelayed({ sendHandshake(g) }, 300)
+        }
+
+        override fun onCharacteristicWrite(g: BluetoothGatt, ch: BluetoothGattCharacteristic, status: Int) {
+            if (ch.uuid == CHAR_WRITE_UUID) {
+                if (!isHandshakeSent) {
+                    NotificationLogger.info("Handshake sent: ${status == BluetoothGatt.GATT_SUCCESS}")
+                    if (status == BluetoothGatt.GATT_SUCCESS) {
+                        isHandshakeSent = true
+                        handler.postDelayed({ startKeepalive(g) }, 300) 
                     }
                 }
-                sendHandshake()
             }
         }
 
-        override fun onCharacteristicChanged(
-            gatt: BluetoothGatt,
-            characteristic: BluetoothGattCharacteristic
-        ) {
-            val data = characteristic.value
-            val hexString = data.joinToString("") { "%02x".format(it) }
-            Log.d(TAG, "RECV: $hexString")
+        override fun onCharacteristicChanged(g: BluetoothGatt, ch: BluetoothGattCharacteristic) {
+            val v = ch.value ?: return
+            NotificationLogger.log(ch.instanceId, v)
 
-            if (data.size < 50) {
-                when (data[0].toInt()) {
+            // NEW: try to catch short button/event packets
+            if (v.size < 50) {
+                when (v[0].toInt() and 0xFF) {
                     0x01 -> dispatchMediaKey(KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE)
                     0x02 -> dispatchMediaKey(KeyEvent.KEYCODE_MEDIA_NEXT)
                     0x03 -> dispatchMediaKey(KeyEvent.KEYCODE_MEDIA_PREVIOUS)
+                    // more cases will be added after Snoop 3
                 }
             }
         }
     }
 
-    private fun sendHandshake() {
-        val handshakeData = byteArrayOf(0x01, 0x00)
-        writeCharacteristic?.let {
-            it.value = handshakeData
-            bluetoothGatt?.writeCharacteristic(it)
-        }
-        val tokenData = hexStringToByteArray(
-            "aa017f0035303030303030303030303030303030303030303064383136353639303532383534663339383231613636326337366365353934630002f7"
-        )
-        writeCharacteristic?.let {
-            it.value = tokenData
-            bluetoothGatt?.writeCharacteristic(it)
-        }
+    private fun sendHandshake(g: BluetoothGatt) {
+        if (isHandshakeSent) return
+        val ch = writeChar ?: return
+        ch.value = hexToBytes(HANDSHAKE_HEX)
+        val queued = g.writeCharacteristic(ch)
+        NotificationLogger.info("Queued handshake: $queued")
     }
 
-    private fun hexStringToByteArray(s: String): ByteArray {
-        val len = s.length
-        val data = ByteArray(len / 2)
-        var i = 0
-        while (i < len) {
-            data[i / 2] = ((Character.digit(s[i], 16) shl 4) + Character.digit(s[i + 1], 16)).toByte()
-            i += 2
+    private fun startKeepalive(g: BluetoothGatt) {
+        if (keepaliveRunning) return
+        keepaliveRunning = true
+        
+        val runnable = object : Runnable {
+            override fun run() {
+                if (!keepaliveRunning) return
+                val ch = writeChar ?: return
+                ch.value = hexToBytes(KEEPALIVE_HEX)
+                g.writeCharacteristic(ch)
+                handler.postDelayed(this, 300) 
+            }
         }
-        return data
+        handler.post(runnable)
+        NotificationLogger.info("Keepalive running")
     }
 
-    fun sendMetadata(title: String, artist: String, album: String) {
-        if (writeCharacteristic == null) return
-
-        val buffer = ByteArrayOutputStream()
-
-        val prefix = intArrayOf(
-            0x62, 0x07, 0x05, 0x8a, 0x08, 0x07, 0xea, 0x0b,
-            0x0a, 0x04, 0x0f, 0x38, 0x8a, 0x05, 0x8b, 0x08,
-            0x00, 0x00, 0x00, 0x55, 0x55, 0x55, 0x55, 0x30
-        ).map { it.toByte() }.toByteArray()
-        buffer.write(prefix)
-
-        buffer.write(artist.toByteArray(Charsets.UTF_16LE))
-        buffer.write(byteArrayOf(0x00, 0x00))
-
-        buffer.write(title.toByteArray(Charsets.UTF_16LE))
-        buffer.write(byteArrayOf(0x00, 0x00))
-
-        buffer.write(album.toByteArray(Charsets.UTF_16LE))
-        buffer.write(byteArrayOf(0x00, 0x00))
-
-        val suffix = intArrayOf(
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x9c, 0x1e, 0x00,
-            0x42, 0x00, 0x69, 0x00, 0x67, 0x00, 0x20, 0x00, 0x59, 0x00,
-            0x65, 0x00, 0x6c, 0x00, 0x6c, 0x00, 0x6f, 0x00, 0x77
-        ).map { it.toByte() }.toByteArray()
-        buffer.write(suffix)
-
-        writeCharacteristic?.let {
-            it.value = buffer.toByteArray()
-            bluetoothGatt?.writeCharacteristic(it)
-            Log.d(TAG, "Sent Metadata: $artist - $title")
-        }
-    }
-
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_STICKY
-    override fun onBind(intent: Intent?): IBinder? = null
+    private fun hexToBytes(hex: String): ByteArray =
+        hex.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
 }
