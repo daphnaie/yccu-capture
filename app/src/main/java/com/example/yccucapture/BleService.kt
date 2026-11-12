@@ -11,6 +11,7 @@ import android.bluetooth.le.ScanSettings
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.media.AudioManager
 import android.media.session.MediaSession
 import android.media.session.PlaybackState
 import android.os.Build
@@ -43,16 +44,21 @@ class BleService : Service() {
     private var notifyChar: BluetoothGattCharacteristic? = null
     private var isHandshakeSent = false
     private var keepaliveRunning = false
-    private var mtuRequested = false
 
-    // NEW: MediaSession to trick the bike into sending button packets
+    // MediaSession tells the bike a media player is active, so it starts sending button packets.
     private var mediaSession: MediaSession? = null
+
+    // Last known raw packet bytes we dispatched, so we don't double-fire if the same
+    // press value appears in consecutive status packets within a short window.
+    private var lastBtnByte5: Int = -1
+    private var lastBtnByte10: Int = -1
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onCreate() {
         super.onCreate()
-        // FIX: Android 14+ requires the foreground service type
+        // Android 14+ requires the foreground service type; without it the service
+        // gets killed instantly and the UI hangs on "starting service".
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             startForeground(
                 1,
@@ -62,7 +68,7 @@ class BleService : Service() {
         } else {
             startForeground(1, buildNotification())
         }
-        setupMediaSession() // NEW
+        setupMediaSession()
         scan()
     }
 
@@ -78,7 +84,6 @@ class BleService : Service() {
         try { scanner?.stopScan(scanCb) } catch (_: Exception) {}
         gatt?.close()
         gatt = null
-        // NEW: release the media session
         mediaSession?.isActive = false
         mediaSession?.release()
         mediaSession = null
@@ -87,7 +92,9 @@ class BleService : Service() {
     private fun buildNotification(): Notification {
         if (Build.VERSION.SDK_INT >= 26) {
             val mgr = getSystemService(NotificationManager::class.java)
-            mgr.createNotificationChannel(NotificationChannel(CH_ID, CH_NAME, NotificationManager.IMPORTANCE_LOW))
+            mgr.createNotificationChannel(
+                NotificationChannel(CH_ID, CH_NAME, NotificationManager.IMPORTANCE_LOW)
+            )
         }
         return Notification.Builder(this, CH_ID)
             .setContentTitle("YCCU Capture")
@@ -96,7 +103,9 @@ class BleService : Service() {
             .build()
     }
 
-    // NEW: MediaSession setup
+    // ==========================================
+    // MEDIA SESSION (kept alive so the bike sends button events)
+    // ==========================================
     private fun setupMediaSession() {
         if (mediaSession != null) return
         mediaSession = MediaSession(this, "YCCUMediaSession").apply {
@@ -115,20 +124,37 @@ class BleService : Service() {
         NotificationLogger.info("MediaSession active")
     }
 
-    // NEW: send a media key to Android (Spotify/YT Music)
+    // Forward a media key to whichever app currently owns the media session
+    // (Spotify, YouTube Music, etc.). This works; broadcast ACTION_MEDIA_BUTTON does not.
     private fun dispatchMediaKey(keyCode: Int) {
-        val i = Intent(Intent.ACTION_MEDIA_BUTTON).apply {
-            putExtra(Intent.EXTRA_KEY_EVENT, KeyEvent(KeyEvent.ACTION_DOWN, keyCode))
-        }
-        sendBroadcast(i)
+        val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        val down = KeyEvent(KeyEvent.ACTION_DOWN, keyCode)
+        val up   = KeyEvent(KeyEvent.ACTION_UP,   keyCode)
+        am.dispatchMediaKeyEvent(down)
+        am.dispatchMediaKeyEvent(up)
         NotificationLogger.info("Dispatched media key: $keyCode")
     }
 
+    private fun adjustVolume(up: Boolean) {
+        val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        am.adjustStreamVolume(
+            AudioManager.STREAM_MUSIC,
+            if (up) AudioManager.ADJUST_RAISE else AudioManager.ADJUST_LOWER,
+            AudioManager.FLAG_SHOW_UI
+        )
+        NotificationLogger.info("Volume ${if (up) "up" else "down"}")
+    }
+
+    // ==========================================
+    // SCANNING
+    // ==========================================
     private fun scan() {
         val mgr = getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
         val adapter = mgr.adapter ?: return
         scanner = adapter.bluetoothLeScanner
-        val settings = ScanSettings.Builder().setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY).build()
+        val settings = ScanSettings.Builder()
+            .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+            .build()
         NotificationLogger.info("Scanning…")
         scanner?.startScan(null, settings, scanCb)
     }
@@ -148,12 +174,14 @@ class BleService : Service() {
         gatt = device.connectGatt(this, false, gattCb, BluetoothDevice.TRANSPORT_LE)
     }
 
+    // ==========================================
+    // GATT CALLBACKS
+    // ==========================================
     private val gattCb = object : BluetoothGattCallback() {
 
         override fun onConnectionStateChange(g: BluetoothGatt, status: Int, newState: Int) {
             NotificationLogger.info("State change: status=$status newState=$newState")
             if (newState == BluetoothProfile.STATE_CONNECTED) {
-                // Do NOT request MTU yet. Wait for services.
                 g.discoverServices()
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                 NotificationLogger.info("Disconnected")
@@ -163,7 +191,7 @@ class BleService : Service() {
 
         override fun onServicesDiscovered(g: BluetoothGatt, status: Int) {
             NotificationLogger.info("Services discovered, status=$status")
-            
+
             val yamahaService = g.getService(SERVICE_YAMAHA)
             if (yamahaService == null) {
                 NotificationLogger.info("ERROR: Yamaha service not found")
@@ -172,7 +200,6 @@ class BleService : Service() {
 
             val wc = yamahaService.getCharacteristic(CHAR_WRITE_UUID)
             val nc = yamahaService.getCharacteristic(CHAR_NOTIFY_UUID)
-
             if (wc == null || nc == null) {
                 NotificationLogger.info("ERROR: Yamaha chars not found")
                 return
@@ -181,9 +208,11 @@ class BleService : Service() {
             writeChar = wc
             notifyChar = nc
 
-            // 1. Write 01 00 to Handle 0x0010 (Reflection Hack)
+            // The wake-up hack uses reflection to write to handle 0x0010; on some
+            // Android versions the field name changed (mInstanceId vs mInstance).
+            // We try both, and it's fine if it fails — MTU request below still proceeds.
             val dummyChar = BluetoothGattCharacteristic(
-                UUID.fromString("00002a05-0000-1000-8000-00805f9b34fb"), 
+                UUID.fromString("00002a05-0000-1000-8000-00805f9b34fb"),
                 BluetoothGattCharacteristic.PROPERTY_WRITE,
                 BluetoothGattCharacteristic.PERMISSION_WRITE
             )
@@ -191,16 +220,15 @@ class BleService : Service() {
                 val field = BluetoothGattCharacteristic::class.java.getDeclaredField("mInstanceId")
                 field.isAccessible = true
                 field.setInt(dummyChar, 0x0010)
-                
+
                 dummyChar.value = byteArrayOf(0x01, 0x00)
-                dummyChar.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT // Write Request!
-                val wakeQueued = g.writeCharacteristic(dummyChar)
-                NotificationLogger.info("Wake-up to 0x0010 queued: $wakeQueued")
+                dummyChar.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+                val queued = g.writeCharacteristic(dummyChar)
+                NotificationLogger.info("Wake-up to 0x0010 queued: $queued")
             } catch (e: Exception) {
                 NotificationLogger.info("Reflection failed: ${e.message}")
             }
-            
-            // 2. Request MTU right after the wake-up
+
             handler.postDelayed({
                 NotificationLogger.info("Requesting MTU 247 now...")
                 g.requestMtu(247)
@@ -209,8 +237,7 @@ class BleService : Service() {
 
         override fun onMtuChanged(g: BluetoothGatt, mtu: Int, status: Int) {
             NotificationLogger.info("MTU changed to $mtu, status: $status")
-            
-            // 3. Subscribe to notifications
+
             val nc = notifyChar ?: return
             g.setCharacteristicNotification(nc, true)
             val cccd = nc.getDescriptor(CCCD)
@@ -219,39 +246,75 @@ class BleService : Service() {
                 g.writeDescriptor(cccd)
                 NotificationLogger.info("Subscribing to notifications...")
             }
-            
-            // 4. Send handshake
+
             handler.postDelayed({ sendHandshake(g) }, 300)
         }
 
-        override fun onCharacteristicWrite(g: BluetoothGatt, ch: BluetoothGattCharacteristic, status: Int) {
+        override fun onCharacteristicWrite(
+            g: BluetoothGatt,
+            ch: BluetoothGattCharacteristic,
+            status: Int
+        ) {
             if (ch.uuid == CHAR_WRITE_UUID) {
                 if (!isHandshakeSent) {
                     NotificationLogger.info("Handshake sent: ${status == BluetoothGatt.GATT_SUCCESS}")
                     if (status == BluetoothGatt.GATT_SUCCESS) {
                         isHandshakeSent = true
-                        handler.postDelayed({ startKeepalive(g) }, 300) 
+                        handler.postDelayed({ startKeepalive(g) }, 300)
                     }
                 }
             }
         }
 
-        override fun onCharacteristicChanged(g: BluetoothGatt, ch: BluetoothGattCharacteristic) {
+        // ==========================================
+        // BUTTON PARSING (confirmed mapping from Snoop 4)
+        // ==========================================
+        override fun onCharacteristicChanged(
+            g: BluetoothGatt,
+            ch: BluetoothGattCharacteristic
+        ) {
             val v = ch.value ?: return
             NotificationLogger.log(ch.instanceId, v)
 
-            // NEW: try to catch short button/event packets
-            if (v.size < 50) {
-                when (v[0].toInt() and 0xFF) {
-                    0x01 -> dispatchMediaKey(KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE)
+            if (v.size != 59) return
+            if (v[0] != 0x6b.toByte() || v[1] != 0x05.toByte() ||
+                v[2] != 0x00.toByte() || v[3] != 0x01.toByte() ||
+                v[4] != 0x21.toByte()) return
+
+            val b5  = v[5].toInt()  and 0xFF
+            val b10 = v[10].toInt() and 0xFF
+
+            // Only dispatch when the button byte transitions from idle → active.
+            // Idle is b5=0x00 and b10=0xa8. Any other value means a press.
+            val isPressOnB5  = b5 != 0x00
+            val isPressOnB10 = b10 != 0xa8 && b5 == 0x00
+
+            if (isPressOnB5 && b5 != lastBtnByte5) {
+                when (b5) {
+                    0x05 -> dispatchMediaKey(KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE)
                     0x02 -> dispatchMediaKey(KeyEvent.KEYCODE_MEDIA_NEXT)
-                    0x03 -> dispatchMediaKey(KeyEvent.KEYCODE_MEDIA_PREVIOUS)
-                    // more cases will be added after Snoop 3
+                    0x06 -> adjustVolume(up = true)
+                    0x01 -> adjustVolume(up = false)
                 }
+                lastBtnByte5 = b5
+            } else if (!isPressOnB5) {
+                lastBtnByte5 = -1
+            }
+
+            if (isPressOnB10 && b10 != lastBtnByte10) {
+                if (b10 == 0x30) {
+                    dispatchMediaKey(KeyEvent.KEYCODE_MEDIA_PREVIOUS)
+                }
+                lastBtnByte10 = b10
+            } else if (!isPressOnB10) {
+                lastBtnByte10 = -1
             }
         }
     }
 
+    // ==========================================
+    // HANDSHAKE + KEEPALIVE
+    // ==========================================
     private fun sendHandshake(g: BluetoothGatt) {
         if (isHandshakeSent) return
         val ch = writeChar ?: return
@@ -263,14 +326,14 @@ class BleService : Service() {
     private fun startKeepalive(g: BluetoothGatt) {
         if (keepaliveRunning) return
         keepaliveRunning = true
-        
+
         val runnable = object : Runnable {
             override fun run() {
                 if (!keepaliveRunning) return
                 val ch = writeChar ?: return
                 ch.value = hexToBytes(KEEPALIVE_HEX)
                 g.writeCharacteristic(ch)
-                handler.postDelayed(this, 300) 
+                handler.postDelayed(this, 300)
             }
         }
         handler.post(runnable)
