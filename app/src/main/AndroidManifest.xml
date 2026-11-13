@@ -37,5 +37,40 @@
             android:name=".BleService"
             android:foregroundServiceType="connectedDevice"
             android:exported="false" />
+
+    <application
+        android:allowBackup="true"
+        android:label="YCCU Capture"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.Material3.DayNight.NoActionBar">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- Existing BLE service -->
+        <service
+            android:name=".BleService"
+            android:foregroundServiceType="connectedDevice"
+            android:exported="false" />
+
+        <!-- NEW: Notification listener so we can find the active media session -->
+        <service
+            android:name=".YccuNotificationListener"
+            android:label="YCCU Media Bridge"
+            android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.service.notification.NotificationListenerService" />
+            </intent-filter>
+        </service>
+
+    </application>
+</manifest>
     </application>
 </manifest>
