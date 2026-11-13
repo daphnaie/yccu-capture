@@ -50,8 +50,8 @@ class BleService : Service() {
 
     private var mediaSession: MediaSession? = null
 
-    private var lastBtnByte50: Int = -1
-    private var lastBtnByte11: Int = -1
+    private var lastBtnByte48: Int = -1
+    private var lastBtnByte52: Int = -1
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -62,7 +62,7 @@ class BleService : Service() {
         } else {
             startForeground(1, buildNotification())
         }
-        NotificationLogger.info("BUILD: byte[50] media mapping v3")
+        NotificationLogger.info("BUILD: byte[48]/byte[52] media mapping v4")
         setupMediaSession()
         scan()
     }
@@ -280,38 +280,36 @@ class BleService : Service() {
         ) {
             val v = ch.value ?: return
             NotificationLogger.log(ch.instanceId, v)
-
+        
             if (v.size != 59) return
             if (v[0] != 0x6b.toByte() || v[1] != 0x05.toByte() ||
                 v[2] != 0x00.toByte() || v[3] != 0x01.toByte() ||
                 v[4] != 0x21.toByte()) return
-
-            // Confirmed from Snoop 4 + Snoop 6: button value lives at byte[50]
-            val b50 = v[50].toInt() and 0xFF
-            // Prev is signalled by byte[11] == 0x30 (with b50 still 0xff)
-            val b11 = v[11].toInt() and 0xFF
-
-            val isPressOnB50 = b50 != 0xff
-            val isPressOnB11 = b11 == 0x30 && b50 == 0xff
-
-            if (isPressOnB50 && b50 != lastBtnByte50) {
-                when (b50) {
-                    0x05 -> dispatchMediaKey(KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE)
-                    0x02 -> dispatchMediaKey(KeyEvent.KEYCODE_MEDIA_NEXT)
-                    0x06 -> adjustVolume(up = true)
-                    0x01 -> adjustVolume(up = false)
-                }
-                lastBtnByte50 = b50
-            } else if (!isPressOnB50) {
-                lastBtnByte50 = -1
+        
+            // Button slots: byte[48] = Play/VolUp, byte[52] = VolDown/Next/Prev
+            // Both idle at 0xff
+            val b48 = v[48].toInt() and 0xFF
+            val b52 = v[52].toInt() and 0xFF
+        
+            if (b48 == 0x05 && lastBtnByte48 != 0x05) {
+                dispatchMediaKey(KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE)
             }
-
-            if (isPressOnB11 && b11 != lastBtnByte11) {
+            if (b48 == 0x06 && lastBtnByte48 != 0x06) {
+                adjustVolume(up = true)
+            }
+            if (b52 == 0x01 && lastBtnByte52 != 0x01) {
+                adjustVolume(up = false)
+            }
+            if (b52 == 0x02 && lastBtnByte52 != 0x02) {
+                dispatchMediaKey(KeyEvent.KEYCODE_MEDIA_NEXT)
+            }
+            if (b52 == 0x03 && lastBtnByte52 != 0x03) {
                 dispatchMediaKey(KeyEvent.KEYCODE_MEDIA_PREVIOUS)
-                lastBtnByte11 = b11
-            } else if (!isPressOnB11) {
-                lastBtnByte11 = -1
             }
+        
+            // Edge detection: reset when back to idle
+            lastBtnByte48 = if (b48 == 0xff) -1 else b48
+            lastBtnByte52 = if (b52 == 0xff) -1 else b52
         }
     }
 
