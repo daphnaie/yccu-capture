@@ -8,11 +8,14 @@ import android.bluetooth.*
 import android.bluetooth.le.ScanCallback
 import android.bluetooth.le.ScanResult
 import android.bluetooth.le.ScanSettings
+import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.media.AudioManager
+import android.media.session.MediaController
 import android.media.session.MediaSession
+import android.media.session.MediaSessionManager
 import android.media.session.PlaybackState
 import android.os.Build
 import android.os.Handler
@@ -45,11 +48,8 @@ class BleService : Service() {
     private var isHandshakeSent = false
     private var keepaliveRunning = false
 
-    // MediaSession tells the bike a media player is active, so it starts sending button packets.
     private var mediaSession: MediaSession? = null
 
-    // Last known raw packet bytes we dispatched, so we don't double-fire if the same
-    // press value appears in consecutive status packets within a short window.
     private var lastBtnByte5: Int = -1
     private var lastBtnByte10: Int = -1
 
@@ -57,14 +57,8 @@ class BleService : Service() {
 
     override fun onCreate() {
         super.onCreate()
-        // Android 14+ requires the foreground service type; without it the service
-        // gets killed instantly and the UI hangs on "starting service".
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(
-                1,
-                buildNotification(),
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
-            )
+            startForeground(1, buildNotification(), ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE)
         } else {
             startForeground(1, buildNotification())
         }
@@ -103,9 +97,6 @@ class BleService : Service() {
             .build()
     }
 
-    // ==========================================
-    // MEDIA SESSION (kept alive so the bike sends button events)
-    // ==========================================
     private fun setupMediaSession() {
         if (mediaSession != null) return
         mediaSession = MediaSession(this, "YCCUMediaSession").apply {
@@ -124,15 +115,52 @@ class BleService : Service() {
         NotificationLogger.info("MediaSession active")
     }
 
-    // Forward a media key to whichever app currently owns the media session
-    // (Spotify, YouTube Music, etc.). This works; broadcast ACTION_MEDIA_BUTTON does not.
+    // ==========================================================
+    // DISPATCH: use MediaSessionManager to find Spotify's session
+    // and call its transport controls directly.
+    // ==========================================================
+    private fun getActiveController(): MediaController? {
+        return try {
+            val msm = getSystemService(Context.MEDIA_SESSION_SERVICE) as MediaSessionManager
+            val listener = ComponentName(this, YccuNotificationListener::class.java)
+            val sessions = msm.getActiveSessions(listener)
+            // Prefer a session that is actually playing; otherwise take the first non-our-own one.
+            sessions.firstOrNull {
+                it.playbackState?.state == PlaybackState.STATE_PLAYING &&
+                it.packageName != packageName
+            } ?: sessions.firstOrNull { it.packageName != packageName }
+        } catch (e: SecurityException) {
+            NotificationLogger.info("MediaSession access denied (grant notification listener)")
+            null
+        } catch (e: Exception) {
+            NotificationLogger.info("getActiveSessions failed: ${e.message}")
+            null
+        }
+    }
+
     private fun dispatchMediaKey(keyCode: Int) {
-        val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
-        val down = KeyEvent(KeyEvent.ACTION_DOWN, keyCode)
-        val up   = KeyEvent(KeyEvent.ACTION_UP,   keyCode)
-        am.dispatchMediaKeyEvent(down)
-        am.dispatchMediaKeyEvent(up)
-        NotificationLogger.info("Dispatched media key: $keyCode")
+        val ctrl = getActiveController()
+        if (ctrl != null) {
+            when (keyCode) {
+                KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE -> {
+                    val state = ctrl.playbackState?.state
+                    if (state == PlaybackState.STATE_PLAYING) {
+                        ctrl.transportControls.pause()
+                    } else {
+                        ctrl.transportControls.play()
+                    }
+                }
+                KeyEvent.KEYCODE_MEDIA_NEXT     -> ctrl.transportControls.skipToNext()
+                KeyEvent.KEYCODE_MEDIA_PREVIOUS -> ctrl.transportControls.skipToPrevious()
+            }
+            NotificationLogger.info("Dispatched via controller (${ctrl.packageName}): $keyCode")
+        } else {
+            // Fallback: AudioManager dispatch (works only if we hold system perm, so usually ignored)
+            val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+            am.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, keyCode))
+            am.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_UP, keyCode))
+            NotificationLogger.info("Dispatched via AudioManager (fallback): $keyCode")
+        }
     }
 
     private fun adjustVolume(up: Boolean) {
@@ -145,9 +173,6 @@ class BleService : Service() {
         NotificationLogger.info("Volume ${if (up) "up" else "down"}")
     }
 
-    // ==========================================
-    // SCANNING
-    // ==========================================
     private fun scan() {
         val mgr = getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
         val adapter = mgr.adapter ?: return
@@ -174,9 +199,6 @@ class BleService : Service() {
         gatt = device.connectGatt(this, false, gattCb, BluetoothDevice.TRANSPORT_LE)
     }
 
-    // ==========================================
-    // GATT CALLBACKS
-    // ==========================================
     private val gattCb = object : BluetoothGattCallback() {
 
         override fun onConnectionStateChange(g: BluetoothGatt, status: Int, newState: Int) {
@@ -191,26 +213,20 @@ class BleService : Service() {
 
         override fun onServicesDiscovered(g: BluetoothGatt, status: Int) {
             NotificationLogger.info("Services discovered, status=$status")
-
             val yamahaService = g.getService(SERVICE_YAMAHA)
             if (yamahaService == null) {
                 NotificationLogger.info("ERROR: Yamaha service not found")
                 return
             }
-
             val wc = yamahaService.getCharacteristic(CHAR_WRITE_UUID)
             val nc = yamahaService.getCharacteristic(CHAR_NOTIFY_UUID)
             if (wc == null || nc == null) {
                 NotificationLogger.info("ERROR: Yamaha chars not found")
                 return
             }
-
             writeChar = wc
             notifyChar = nc
 
-            // The wake-up hack uses reflection to write to handle 0x0010; on some
-            // Android versions the field name changed (mInstanceId vs mInstance).
-            // We try both, and it's fine if it fails — MTU request below still proceeds.
             val dummyChar = BluetoothGattCharacteristic(
                 UUID.fromString("00002a05-0000-1000-8000-00805f9b34fb"),
                 BluetoothGattCharacteristic.PROPERTY_WRITE,
@@ -220,7 +236,6 @@ class BleService : Service() {
                 val field = BluetoothGattCharacteristic::class.java.getDeclaredField("mInstanceId")
                 field.isAccessible = true
                 field.setInt(dummyChar, 0x0010)
-
                 dummyChar.value = byteArrayOf(0x01, 0x00)
                 dummyChar.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
                 val queued = g.writeCharacteristic(dummyChar)
@@ -237,7 +252,6 @@ class BleService : Service() {
 
         override fun onMtuChanged(g: BluetoothGatt, mtu: Int, status: Int) {
             NotificationLogger.info("MTU changed to $mtu, status: $status")
-
             val nc = notifyChar ?: return
             g.setCharacteristicNotification(nc, true)
             val cccd = nc.getDescriptor(CCCD)
@@ -246,7 +260,6 @@ class BleService : Service() {
                 g.writeDescriptor(cccd)
                 NotificationLogger.info("Subscribing to notifications...")
             }
-
             handler.postDelayed({ sendHandshake(g) }, 300)
         }
 
@@ -266,9 +279,6 @@ class BleService : Service() {
             }
         }
 
-        // ==========================================
-        // BUTTON PARSING (confirmed mapping from Snoop 4)
-        // ==========================================
         override fun onCharacteristicChanged(
             g: BluetoothGatt,
             ch: BluetoothGattCharacteristic
@@ -284,8 +294,6 @@ class BleService : Service() {
             val b5  = v[5].toInt()  and 0xFF
             val b10 = v[10].toInt() and 0xFF
 
-            // Only dispatch when the button byte transitions from idle → active.
-            // Idle is b5=0x00 and b10=0xa8. Any other value means a press.
             val isPressOnB5  = b5 != 0x00
             val isPressOnB10 = b10 != 0xa8 && b5 == 0x00
 
@@ -312,9 +320,6 @@ class BleService : Service() {
         }
     }
 
-    // ==========================================
-    // HANDSHAKE + KEEPALIVE
-    // ==========================================
     private fun sendHandshake(g: BluetoothGatt) {
         if (isHandshakeSent) return
         val ch = writeChar ?: return
@@ -326,7 +331,6 @@ class BleService : Service() {
     private fun startKeepalive(g: BluetoothGatt) {
         if (keepaliveRunning) return
         keepaliveRunning = true
-
         val runnable = object : Runnable {
             override fun run() {
                 if (!keepaliveRunning) return
