@@ -62,6 +62,7 @@ class BleService : Service() {
         } else {
             startForeground(1, buildNotification())
         }
+        NotificationLogger.info("BUILD: byte[50] media mapping v3")
         setupMediaSession()
         scan()
     }
@@ -279,45 +280,45 @@ class BleService : Service() {
             }
         }
 
-override fun onCharacteristicChanged(
-    g: BluetoothGatt,
-    ch: BluetoothGattCharacteristic
-) {
-    val v = ch.value ?: return
-    NotificationLogger.log(ch.instanceId, v)
-
-    if (v.size != 59) return
-    if (v[0] != 0x6b.toByte() || v[1] != 0x05.toByte() ||
-        v[2] != 0x00.toByte() || v[3] != 0x01.toByte() ||
-        v[4] != 0x21.toByte()) return
-
-    // Button payload lives at byte[50] (0-based) in the fixed 59-byte packet
-    val b50 = v[50].toInt() and 0xFF
-    // Prev is signalled by byte[11] flipping to 0x30
-    val b11 = v[11].toInt() and 0xFF
-
-    val isPressOnB50 = b50 != 0xff
-    val isPressOnB11 = b11 == 0x30 && b50 == 0xff
-
-    if (isPressOnB50 && b50 != lastBtnByte5) {
-        when (b50) {
-            0x05 -> dispatchMediaKey(KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE)
-            0x02 -> dispatchMediaKey(KeyEvent.KEYCODE_MEDIA_NEXT)
-            0x06 -> adjustVolume(up = true)
-            0x01 -> adjustVolume(up = false)
+        override fun onCharacteristicChanged(
+            g: BluetoothGatt,
+            ch: BluetoothGattCharacteristic
+        ) {
+            val v = ch.value ?: return
+            NotificationLogger.log(ch.instanceId, v)
+        
+            if (v.size != 59) return
+            if (v[0] != 0x6b.toByte() || v[1] != 0x05.toByte() ||
+                v[2] != 0x00.toByte() || v[3] != 0x01.toByte() ||
+                v[4] != 0x21.toByte()) return
+        
+            // Button payload lives at byte[50] (0-based) in the fixed 59-byte packet
+            val b50 = v[50].toInt() and 0xFF
+            // Prev is signalled by byte[11] flipping to 0x30
+            val b11 = v[11].toInt() and 0xFF
+        
+            val isPressOnB50 = b50 != 0xff
+            val isPressOnB11 = b11 == 0x30 && b50 == 0xff
+        
+            if (isPressOnB50 && b50 != lastBtnByte5) {
+                when (b50) {
+                    0x05 -> dispatchMediaKey(KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE)
+                    0x02 -> dispatchMediaKey(KeyEvent.KEYCODE_MEDIA_NEXT)
+                    0x06 -> adjustVolume(up = true)
+                    0x01 -> adjustVolume(up = false)
+                }
+                lastBtnByte5 = b50
+            } else if (!isPressOnB50) {
+                lastBtnByte5 = -1
+            }
+        
+            if (isPressOnB11 && b11 != lastBtnByte10) {
+                dispatchMediaKey(KeyEvent.KEYCODE_MEDIA_PREVIOUS)
+                lastBtnByte10 = b11
+            } else if (!isPressOnB11) {
+                lastBtnByte10 = -1
+            }
         }
-        lastBtnByte5 = b50
-    } else if (!isPressOnB50) {
-        lastBtnByte5 = -1
-    }
-
-    if (isPressOnB11 && b11 != lastBtnByte10) {
-        dispatchMediaKey(KeyEvent.KEYCODE_MEDIA_PREVIOUS)
-        lastBtnByte10 = b11
-    } else if (!isPressOnB11) {
-        lastBtnByte10 = -1
-    }
-}
 
     private fun sendHandshake(g: BluetoothGatt) {
         if (isHandshakeSent) return
