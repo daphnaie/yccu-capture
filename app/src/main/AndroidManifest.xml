@@ -33,26 +33,6 @@
             </intent-filter>
         </activity>
 
-        <service
-            android:name=".BleService"
-            android:foregroundServiceType="connectedDevice"
-            android:exported="false" />
-
-    <application
-        android:allowBackup="true"
-        android:label="YCCU Capture"
-        android:supportsRtl="true"
-        android:theme="@style/Theme.Material3.DayNight.NoActionBar">
-
-        <activity
-            android:name=".MainActivity"
-            android:exported="true">
-            <intent-filter>
-                <action android:name="android.intent.action.MAIN" />
-                <category android:name="android.intent.category.LAUNCHER" />
-            </intent-filter>
-        </activity>
-
         <!-- Existing BLE service -->
         <service
             android:name=".BleService"
@@ -70,7 +50,5 @@
             </intent-filter>
         </service>
 
-    </application>
-</manifest>
     </application>
 </manifest>
