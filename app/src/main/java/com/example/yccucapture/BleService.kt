@@ -1,4 +1,4 @@
-package com.example.yccu // TODO: match your package name
+package com.example.yccucapture
 
 import android.app.Service
 import android.bluetooth.BluetoothAdapter
@@ -29,8 +29,8 @@ class BleService : Service() {
         private const val TAG = "YccuBle"
 
         // Service action names for startService()
-        const val ACTION_START_SCAN = "com.example.yccu.action.START_SCAN"
-        const val ACTION_STOP = "com.example.yccu.action.STOP"
+        const val ACTION_START_SCAN = "com.example.yccucapture.action.START_SCAN"
+        const val ACTION_STOP       = "com.example.yccucapture.action.STOP"
 
         // TODO: replace with the real UUIDs from your GATT discovery log.
         // These are placeholders that match a common Yamaha CCU layout.
