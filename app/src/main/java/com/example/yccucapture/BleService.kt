@@ -50,8 +50,8 @@ class BleService : Service() {
 
     private var mediaSession: MediaSession? = null
 
-    private var lastBtnByte5: Int = -1
-    private var lastBtnByte10: Int = -1
+    private var lastBtnByte50: Int = -1
+    private var lastBtnByte11: Int = -1
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -116,16 +116,11 @@ class BleService : Service() {
         NotificationLogger.info("MediaSession active")
     }
 
-    // ==========================================================
-    // DISPATCH: use MediaSessionManager to find Spotify's session
-    // and call its transport controls directly.
-    // ==========================================================
     private fun getActiveController(): MediaController? {
         return try {
             val msm = getSystemService(Context.MEDIA_SESSION_SERVICE) as MediaSessionManager
             val listener = ComponentName(this, YccuNotificationListener::class.java)
             val sessions = msm.getActiveSessions(listener)
-            // Prefer a session that is actually playing; otherwise take the first non-our-own one.
             sessions.firstOrNull {
                 it.playbackState?.state == PlaybackState.STATE_PLAYING &&
                 it.packageName != packageName
@@ -156,7 +151,6 @@ class BleService : Service() {
             }
             NotificationLogger.info("Dispatched via controller (${ctrl.packageName}): $keyCode")
         } else {
-            // Fallback: AudioManager dispatch (works only if we hold system perm, so usually ignored)
             val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
             am.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, keyCode))
             am.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_UP, keyCode))
@@ -286,39 +280,40 @@ class BleService : Service() {
         ) {
             val v = ch.value ?: return
             NotificationLogger.log(ch.instanceId, v)
-        
+
             if (v.size != 59) return
             if (v[0] != 0x6b.toByte() || v[1] != 0x05.toByte() ||
                 v[2] != 0x00.toByte() || v[3] != 0x01.toByte() ||
                 v[4] != 0x21.toByte()) return
-        
-            // Button payload lives at byte[50] (0-based) in the fixed 59-byte packet
+
+            // Confirmed from Snoop 4 + Snoop 6: button value lives at byte[50]
             val b50 = v[50].toInt() and 0xFF
-            // Prev is signalled by byte[11] flipping to 0x30
+            // Prev is signalled by byte[11] == 0x30 (with b50 still 0xff)
             val b11 = v[11].toInt() and 0xFF
-        
+
             val isPressOnB50 = b50 != 0xff
             val isPressOnB11 = b11 == 0x30 && b50 == 0xff
-        
-            if (isPressOnB50 && b50 != lastBtnByte5) {
+
+            if (isPressOnB50 && b50 != lastBtnByte50) {
                 when (b50) {
                     0x05 -> dispatchMediaKey(KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE)
                     0x02 -> dispatchMediaKey(KeyEvent.KEYCODE_MEDIA_NEXT)
                     0x06 -> adjustVolume(up = true)
                     0x01 -> adjustVolume(up = false)
                 }
-                lastBtnByte5 = b50
+                lastBtnByte50 = b50
             } else if (!isPressOnB50) {
-                lastBtnByte5 = -1
+                lastBtnByte50 = -1
             }
-        
-            if (isPressOnB11 && b11 != lastBtnByte10) {
+
+            if (isPressOnB11 && b11 != lastBtnByte11) {
                 dispatchMediaKey(KeyEvent.KEYCODE_MEDIA_PREVIOUS)
-                lastBtnByte10 = b11
+                lastBtnByte11 = b11
             } else if (!isPressOnB11) {
-                lastBtnByte10 = -1
+                lastBtnByte11 = -1
             }
         }
+    }
 
     private fun sendHandshake(g: BluetoothGatt) {
         if (isHandshakeSent) return
