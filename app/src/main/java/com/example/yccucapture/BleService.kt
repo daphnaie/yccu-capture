@@ -286,30 +286,39 @@ class BleService : Service() {
                 v[2] != 0x00.toByte() || v[3] != 0x01.toByte() ||
                 v[4] != 0x21.toByte()) return
         
-            // Button slots: byte[48] = Play/VolUp, byte[52] = VolDown/Next/Prev
-            // Both idle at 0xff
             val b48 = v[48].toInt() and 0xFF
             val b52 = v[52].toInt() and 0xFF
         
+            // Play: short press Play button → b48 = 0x05
             if (b48 == 0x05 && lastBtnByte48 != 0x05) {
                 dispatchMediaKey(KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE)
+                lastBtnByte48 = 0x05
             }
+        
+            // Vol+ (short OR long) → b48 = 0x06
+            // Short press = Volume Up, Long press = Next (bike sends same byte; we can't distinguish)
             if (b48 == 0x06 && lastBtnByte48 != 0x06) {
                 adjustVolume(up = true)
+                lastBtnByte48 = 0x06
             }
+        
+            // Vol− (short OR long) → b52 = 0x01 or 0x02 depending on bike state
+            // We'll map 0x01 → Volume Down, 0x02 → Next, 0x03 → Previous
             if (b52 == 0x01 && lastBtnByte52 != 0x01) {
                 adjustVolume(up = false)
+                lastBtnByte52 = 0x01
             }
             if (b52 == 0x02 && lastBtnByte52 != 0x02) {
                 dispatchMediaKey(KeyEvent.KEYCODE_MEDIA_NEXT)
+                lastBtnByte52 = 0x02
             }
             if (b52 == 0x03 && lastBtnByte52 != 0x03) {
                 dispatchMediaKey(KeyEvent.KEYCODE_MEDIA_PREVIOUS)
+                lastBtnByte52 = 0x03
             }
         
-            // Edge detection: reset when back to idle
-            lastBtnByte48 = if (b48 == 0xff) -1 else b48
-            lastBtnByte52 = if (b52 == 0xff) -1 else b52
+            if (b48 == 0xff) lastBtnByte48 = -1
+            if (b52 == 0xff) lastBtnByte52 = -1
         }
     }
 
